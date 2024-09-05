@@ -1,4 +1,7 @@
+torch
+torchvision
 accelerate
 datasets
 transformers
 numpy
+

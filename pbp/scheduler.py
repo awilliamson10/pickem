@@ -21,3 +21,14 @@ def cosine_lr(optimizer, base_lr, warmup_length, steps):
         assign_learning_rate(optimizer, lr)
         return lr
     return _lr_adjuster
+
+# write a constant learning rate scheduler  
+def constant_lr(optimizer, base_lr, warmup_length, steps):
+    def _lr_adjuster(step):
+        if step < warmup_length:
+            lr = _warmup_lr(base_lr, warmup_length, step)
+        else:
+            lr = base_lr
+        assign_learning_rate(optimizer, lr)
+        return lr
+    return _lr_adjuster

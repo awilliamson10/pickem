@@ -1,0 +1,6 @@
+{
+  "bos_token": "[GAME_START]",
+  "eos_token": "[GAME_END]",
+  "pad_token": "[PAD]",
+  "unk_token": "[UNK]"
+}

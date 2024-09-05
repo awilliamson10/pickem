@@ -82,6 +82,17 @@ class PBPConfig(LlamaConfig):
     eval_interval: int = 100
     eval_steps: int = 100
 
+    team_embedding_dim: int = 256
+    length_sample: bool = False
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        for key, value in kwargs.items():
+            if hasattr(self, key):
+                setattr(self, key, value)
+            else:
+                raise ValueError(f"Invalid argument: {key}")
+
 def parse_yaml_to_config(yaml_path: str) -> PBPConfig:
     with open(yaml_path, "r") as f:
         config_dict = yaml.safe_load(f)

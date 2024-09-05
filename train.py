@@ -2,27 +2,28 @@ import argparse
 import itertools
 import logging
 import os
-
 import torch
 from accelerate import Accelerator
 from datasets import load_dataset
 from tqdm.auto import tqdm
-from transformers import LlamaForCausalLM
-
+# from pbp.model import LlamaForCausalLM
+from transformers import PreTrainedTokenizerFast, LlamaForCausalLM
+from pbp.dataloader import collate_fn, LengthBasedBatchSampler, tokenize_collate
 from pbp.config import PBPConfig, parse_yaml_to_config
-from pbp.scheduler import cosine_lr
+from pbp.scheduler import cosine_lr, constant_lr
+from transformers import PreTrainedTokenizerFast
 
 logger = logging.getLogger(__name__)
 
 @torch.no_grad()
-def evaluate(model, dataloader, config):
+def evaluate(model, dataloader, config, tokenizer):
     out = {}
     model.eval()
     losses = torch.zeros(config.eval_steps)
     for k in range(config.eval_steps):
         batch = next(iter(dataloader))
-        loss = model(input_ids=batch["input_ids"], labels=batch["labels"]).loss
-        losses[k] = loss.item()
+        outputs = model(input_ids=batch["input_ids"], labels=batch["labels"], team_embeddings=batch["teams"])
+        losses[k] = outputs.loss.item()
     out["eval_loss"] = losses.mean()
     model.train()
     return out
@@ -33,20 +34,6 @@ def init_model(config: PBPConfig):
     if config.compile:
         model.compile()
     return model
-
-
-def collate_fn(batch):
-    input_ids = torch.stack([torch.tensor(item['input_ids']) for item in batch])
-    attention_mask = torch.stack([torch.tensor(item['attention_mask']) for item in batch])
-    
-    # Labels are identical to input_ids
-    labels = input_ids.clone()
-    
-    return {
-        'input_ids': input_ids,
-        'attention_mask': attention_mask,
-        'labels': labels
-    }
 
 
 def main(config: PBPConfig):
@@ -81,20 +68,43 @@ def main(config: PBPConfig):
     train_dataset = load_dataset(path=config.train_dataset, split="train")
     eval_dataset = load_dataset(path=config.eval_dataset, split="test")
 
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        collate_fn=collate_fn,
-        num_workers=4,
-        shuffle=True,
-    )
-    eval_dataloader = torch.utils.data.DataLoader(
-        eval_dataset,
-        batch_size=config.batch_size,
-        collate_fn=collate_fn,
-        num_workers=4,
-        shuffle=False,
-    )
+    if config.length_sample:
+        accelerator.print("Using length-based sampling.")
+        train_sampler = LengthBasedBatchSampler(train_dataset, batch_size=config.batch_size)
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_sampler=train_sampler,
+            collate_fn=tokenize_collate,
+            num_workers=4,
+            pin_memory=True
+        )
+
+        eval_dataloader = torch.utils.data.DataLoader(
+            eval_dataset,
+            batch_size=config.batch_size,
+            collate_fn=tokenize_collate,
+            num_workers=4,
+            shuffle=False,
+            pin_memory=True
+        )
+    else:
+        accelerator.print("Using standard sampling.")
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            collate_fn=tokenize_collate,
+            num_workers=4,
+            shuffle=True,
+            pin_memory=True
+        )
+        eval_dataloader = torch.utils.data.DataLoader(
+            eval_dataset,
+            batch_size=config.batch_size,
+            collate_fn=tokenize_collate,
+            num_workers=4,
+            shuffle=False,
+            pin_memory=True
+        )
     assert len(train_dataloader), "No data found, please check your data location."
 
     if config.gradient_checkpointing:
@@ -130,7 +140,7 @@ def main(config: PBPConfig):
     )
 
     # create scheduler if train
-    total_steps = train_dataloader.num_batches * config.epochs
+    total_steps = len(train_dataloader) * config.epochs
     # if args.warmup is float, it is a percentage of total_steps
     if isinstance(config.warmup, float):
         assert (
@@ -139,6 +149,7 @@ def main(config: PBPConfig):
         config.warmup = int(config.warmup * total_steps)
 
     scheduler = cosine_lr(optimizer, config.learning_rate, config.warmup, total_steps)
+    # scheduler = constant_lr(optimizer, config.learning_rate, config.warmup, total_steps)
 
     model, optimizer, scheduler, train_dataloader, eval_dataloader = (
         accelerator.prepare(
@@ -151,6 +162,11 @@ def main(config: PBPConfig):
     print(f"  Num Epochs = {config.epochs}")
     print(f"  Instantaneous batch size per device = {config.batch_size}")
     print(f"  Gradient Accumulation steps = {config.gradient_accumulation_steps}")
+    # print number of parameters in model
+    total_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"  Total Trainable Parameters: {total_trainable_params:,}")
+    print(f"  Total Parameters: {total_params:,}")
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(
         range(config.epochs * len(train_dataloader)),
@@ -160,19 +176,26 @@ def main(config: PBPConfig):
     global_step = 0
     best_val_loss = float("inf")
 
+    tokenizer = PreTrainedTokenizerFast.from_pretrained("pickem_tokenizer")
+
     for epoch in range(config.epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
             if accelerator.is_local_main_process:
                 if global_step % config.eval_interval == 0:
                     if accelerator.is_local_main_process:
-                        eval_loss = evaluate(model, eval_dataloader, config)
-                        accelerator.log(eval_loss, step=global_step)
-                        progress_bar.write(
-                            f"Step: {global_step}, Eval loss: {eval_loss['eval_loss']}"
+                        eval_results = evaluate(model, eval_dataloader, config, tokenizer)
+                        accelerator.log(
+                            {
+                                "eval_loss": eval_results["eval_loss"]
+                            },
+                            step=global_step
                         )
-                        if eval_loss["eval_loss"] < best_val_loss:
-                            best_val_loss = eval_loss["eval_loss"]
+                        progress_bar.write(
+                            f"Step: {global_step}, Eval loss: {eval_results['eval_loss']}"
+                        )
+                        if eval_results["eval_loss"] < best_val_loss:
+                            best_val_loss = eval_results["eval_loss"]
                             save_path = os.path.join(
                                 config.output_dir, "best_model"
                             )
@@ -185,7 +208,8 @@ def main(config: PBPConfig):
                     model.save_pretrained(save_path)
 
             input_ids, attention_mask, labels = batch["input_ids"], batch["attention_mask"], batch["labels"]
-            loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
+            teams = batch["teams"]
+            loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, team_embeddings=teams).loss
             accelerator.backward(loss)
             if accelerator.sync_gradients:
                 params_to_clip = model.parameters()
