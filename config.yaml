@@ -1,38 +1,26 @@
-vocab_size: 768
-hidden_size: 2048
-intermediate_size: 4096
-num_hidden_layers: 24
-num_attention_heads: 16
-
-hidden_act: "silu"
-max_position_embeddings: 1024
-initializer_range: 0.02
-use_cache: False
-
-pad_token_id: 1
-bos_token_id: 5
-eos_token_id: 6
-
-tie_word_embeddings: True
-
 seed: 42
 device: "cuda"
-output_dir: "./pickem"
-wandb: True
-wandb_project: pickem-team-emb
-train_dataset: awilliamson/pickem_tokenized-te
-eval_dataset: awilliamson/pickem_tokenized-te
+output_dir: "./pickem-std"
+wandb: False
+wandb_project: pickem-std
+train_dataset: awilliamson/football
+eval_dataset: awilliamson/football
 compile: False
 precision: "bf16"
-batch_size: 64
-gradient_accumulation_steps: 1
+length_sample: False
+
+batch_size: 128
+gradient_accumulation_steps: 2
 gradient_checkpointing: True
 use_8bit_adam: False
+
+attention_dropout: 0.1
 learning_rate: 1e-4
 adam_beta1: 0.9
 adam_beta2: 0.999
-epochs: 3
-warmup: 0.01
-save_interval: 500
-eval_interval: 100
-eval_steps: 1
+epochs: 5
+warmup: 0.03
+
+save_interval: 750
+eval_interval: 250
+eval_steps: 25

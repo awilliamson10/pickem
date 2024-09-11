@@ -6,31 +6,61 @@ import torch
 from accelerate import Accelerator
 from datasets import load_dataset
 from tqdm.auto import tqdm
-# from pbp.model import LlamaForCausalLM
-from transformers import PreTrainedTokenizerFast, LlamaForCausalLM
-from pbp.dataloader import collate_fn, LengthBasedBatchSampler, tokenize_collate
+from pbp.ademix import AdEMAMix
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from pbp.dataloader import tokenize_collate
 from pbp.config import PBPConfig, parse_yaml_to_config
-from pbp.scheduler import cosine_lr, constant_lr
-from transformers import PreTrainedTokenizerFast
+from pbp.scheduler import cosine_lr
+from itertools import cycle
 
 logger = logging.getLogger(__name__)
 
+
 @torch.no_grad()
-def evaluate(model, dataloader, config, tokenizer):
-    out = {}
+def evaluate(model, dataloader, config):
     model.eval()
-    losses = torch.zeros(config.eval_steps)
-    for k in range(config.eval_steps):
-        batch = next(iter(dataloader))
-        outputs = model(input_ids=batch["input_ids"], labels=batch["labels"], team_embeddings=batch["teams"])
-        losses[k] = outputs.loss.item()
-    out["eval_loss"] = losses.mean()
+    total_loss = 0
+    total_steps = min(len(dataloader), config.eval_steps)
+    
+    # Use cycle to loop over the dataloader indefinitely
+    dataloader_cycle = cycle(dataloader)
+    
+    for step in range(total_steps):
+        try:
+            batch = next(dataloader_cycle)
+            batch = {k: v.to(model.device) for k, v in batch.items()}
+            
+            outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=batch["labels"])
+            loss = outputs.loss.item()
+            total_loss += loss
+            
+            # Clear GPU memory
+            del outputs, batch
+            torch.cuda.empty_cache()
+            
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"WARNING: ran out of memory during evaluation at step {step}")
+                if step > 0:
+                    return {"eval_loss": total_loss / step}
+                else:
+                    raise e
+            else:
+                raise e
+        except StopIteration:
+            print(f"WARNING: dataloader exhausted at step {step}")
+            break
+    
     model.train()
-    return out
+    return {"eval_loss": total_loss / total_steps if total_steps > 0 else float('inf')}
+    
 
 
 def init_model(config: PBPConfig):
-    model = LlamaForCausalLM(config=config).to(config.device)
+    if config.pretrained:
+        model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct").to(config.device)
+    else:
+        model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct").to(config.device)
     if config.compile:
         model.compile()
     return model
@@ -68,59 +98,37 @@ def main(config: PBPConfig):
     train_dataset = load_dataset(path=config.train_dataset, split="train")
     eval_dataset = load_dataset(path=config.eval_dataset, split="test")
 
-    if config.length_sample:
-        accelerator.print("Using length-based sampling.")
-        train_sampler = LengthBasedBatchSampler(train_dataset, batch_size=config.batch_size)
-        train_dataloader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_sampler=train_sampler,
-            collate_fn=tokenize_collate,
-            num_workers=4,
-            pin_memory=True
-        )
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
 
-        eval_dataloader = torch.utils.data.DataLoader(
-            eval_dataset,
-            batch_size=config.batch_size,
-            collate_fn=tokenize_collate,
-            num_workers=4,
-            shuffle=False,
-            pin_memory=True
-        )
-    else:
-        accelerator.print("Using standard sampling.")
-        train_dataloader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=config.batch_size,
-            collate_fn=tokenize_collate,
-            num_workers=4,
-            shuffle=True,
-            pin_memory=True
-        )
-        eval_dataloader = torch.utils.data.DataLoader(
-            eval_dataset,
-            batch_size=config.batch_size,
-            collate_fn=tokenize_collate,
-            num_workers=4,
-            shuffle=False,
-            pin_memory=True
-        )
+    if accelerator.state.deepspeed_plugin:
+        accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = config.batch_size
+
+    accelerator.print("Using standard sampling.")
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=config.batch_size,
+        collate_fn=tokenize_collate(tokenizer),
+        num_workers=4,
+        shuffle=True,
+        pin_memory=True
+    )
+    eval_dataloader = torch.utils.data.DataLoader(
+        eval_dataset,
+        batch_size=config.batch_size,
+        collate_fn=tokenize_collate(tokenizer),
+        num_workers=4,
+        shuffle=False,
+        pin_memory=True
+    )
     assert len(train_dataloader), "No data found, please check your data location."
 
     if config.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
-    if config.use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError(
-                "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
-            )
-
-        optimizer_class = bnb.optim.AdamW8bit
-    else:
+    if config.use_adam:
         optimizer_class = torch.optim.AdamW
+    else:
+        optimizer_class = AdEMAMix
 
     if isinstance(config.learning_rate, str):
         config.learning_rate = float(config.learning_rate)
@@ -135,8 +143,9 @@ def main(config: PBPConfig):
     optimizer = optimizer_class(
         params_to_optimize,
         lr=config.learning_rate,
-        betas=(config.adam_beta1, config.adam_beta2),
+        betas=(config.adam_beta1, config.adam_beta2, 0.9999),
         eps=config.adam_epsilon,
+        weight_decay=config.weight_decay,
     )
 
     # create scheduler if train
@@ -176,15 +185,13 @@ def main(config: PBPConfig):
     global_step = 0
     best_val_loss = float("inf")
 
-    tokenizer = PreTrainedTokenizerFast.from_pretrained("pickem_tokenizer")
-
     for epoch in range(config.epochs):
         model.train()
         for step, batch in enumerate(train_dataloader):
             if accelerator.is_local_main_process:
                 if global_step % config.eval_interval == 0:
                     if accelerator.is_local_main_process:
-                        eval_results = evaluate(model, eval_dataloader, config, tokenizer)
+                        eval_results = evaluate(model, eval_dataloader, config)
                         accelerator.log(
                             {
                                 "eval_loss": eval_results["eval_loss"]
@@ -208,8 +215,7 @@ def main(config: PBPConfig):
                     model.save_pretrained(save_path)
 
             input_ids, attention_mask, labels = batch["input_ids"], batch["attention_mask"], batch["labels"]
-            teams = batch["teams"]
-            loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, team_embeddings=teams).loss
+            loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
             accelerator.backward(loss)
             if accelerator.sync_gradients:
                 params_to_clip = model.parameters()

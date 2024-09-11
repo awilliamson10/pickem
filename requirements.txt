@@ -4,4 +4,4 @@ accelerate
 datasets
 transformers
 numpy
-
+wandb
