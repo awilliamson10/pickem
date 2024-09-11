@@ -143,7 +143,7 @@ def main(config: PBPConfig):
     optimizer = optimizer_class(
         params_to_optimize,
         lr=config.learning_rate,
-        betas=(config.adam_beta1, config.adam_beta2, 0.9999),
+        betas=(config.adam_beta1, config.adam_beta2) if config.use_adam else (config.adam_beta1, config.adam_beta2, 0.9999),
         eps=config.adam_epsilon,
         weight_decay=config.weight_decay,
     )

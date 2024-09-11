@@ -1,18 +1,17 @@
 seed: 42
 device: "cuda"
-output_dir: "./pickem-std"
+output_dir: "./pickem-qwen"
 wandb: False
-wandb_project: pickem-std
-train_dataset: awilliamson/football
-eval_dataset: awilliamson/football
+wandb_project: pickem-qwen
+train_dataset: awilliamson/cfb-qwen
+eval_dataset: awilliamson/cfb-qwen
 compile: False
 precision: "bf16"
-length_sample: False
 
-batch_size: 128
-gradient_accumulation_steps: 2
+batch_size: 1
+gradient_accumulation_steps: 1
 gradient_checkpointing: True
-use_8bit_adam: False
+use_adam: True
 
 attention_dropout: 0.1
 learning_rate: 1e-4
@@ -21,6 +20,6 @@ adam_beta2: 0.999
 epochs: 5
 warmup: 0.03
 
-save_interval: 750
-eval_interval: 250
-eval_steps: 25
+save_interval: 500
+eval_interval: 100
+eval_steps: 10
