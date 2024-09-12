@@ -19,41 +19,19 @@ logger = logging.getLogger(__name__)
 @torch.no_grad()
 def evaluate(model, dataloader, config):
     model.eval()
-    total_loss = 0
-    total_steps = min(len(dataloader), config.eval_steps)
+    losses = torch.zeros(config.eval_steps)
     
-    # Use cycle to loop over the dataloader indefinitely
-    dataloader_cycle = cycle(dataloader)
-    
-    for step in range(total_steps):
+    for k, batch in zip(range(config.eval_steps), cycle(dataloader)):
         try:
-            batch = next(dataloader_cycle)
             batch = {k: v.to(model.device) for k, v in batch.items()}
             
             outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], labels=batch["labels"])
-            loss = outputs.loss.item()
-            total_loss += loss
-            
-            # Clear GPU memory
-            del outputs, batch
-            torch.cuda.empty_cache()
-            
-        except RuntimeError as e:
-            if "out of memory" in str(e):
-                print(f"WARNING: ran out of memory during evaluation at step {step}")
-                if step > 0:
-                    return {"eval_loss": total_loss / step}
-                else:
-                    raise e
-            else:
-                raise e
+            losses[k] = outputs.loss.item()
         except StopIteration:
-            print(f"WARNING: dataloader exhausted at step {step}")
             break
-    
+
     model.train()
-    return {"eval_loss": total_loss / total_steps if total_steps > 0 else float('inf')}
-    
+    return {"eval_loss": losses.mean().item()}
 
 
 def init_model(config: PBPConfig):
