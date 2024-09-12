@@ -7,7 +7,7 @@ from accelerate import Accelerator
 from datasets import load_dataset
 from tqdm.auto import tqdm
 from pbp.ademix import AdEMAMix
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from pbp.dataloader import tokenize_collate
 from pbp.config import PBPConfig, parse_yaml_to_config
 from pbp.scheduler import cosine_lr
@@ -58,9 +58,11 @@ def evaluate(model, dataloader, config):
 
 def init_model(config: PBPConfig):
     if config.pretrained:
-        model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct").to(config.device)
+        pretrained_config = AutoConfig.from_pretrained(config.pretrained)
+        pretrained_config.max_position_embeddings = 8192
+        model = AutoModelForCausalLM.from_pretrained(config.pretrained, config=pretrained_config).to(config.device)
     else:
-        model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-0.5B-Instruct").to(config.device)
+        model = AutoModelForCausalLM(config).to(config.device)
     if config.compile:
         model.compile()
     return model
@@ -98,7 +100,15 @@ def main(config: PBPConfig):
     train_dataset = load_dataset(path=config.train_dataset, split="train")
     eval_dataset = load_dataset(path=config.eval_dataset, split="test")
 
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2-0.5B-Instruct")
+    tokenizer = AutoTokenizer.from_pretrained(config.pretrained) if config.pretrained else AutoTokenizer.from_pretrained("gpt2")
+    tokenizer.add_special_tokens({
+        "additional_special_tokens": [
+            "<|game_start|>",
+            "<|game_end|>",
+            "<|play_start|>",
+            "<|play_end|>"
+        ]
+    })
 
     if accelerator.state.deepspeed_plugin:
         accelerator.state.deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu'] = config.batch_size
